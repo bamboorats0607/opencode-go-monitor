@@ -1,0 +1,8 @@
+# OpenCode GO 用量监控 — 依赖清单
+# 运行依赖
+PySide6>=6.6
+requests>=2.31
+pyqtgraph>=0.13        # 趋势图；安装失败时程序自动降级为无图表 KPI 卡片
+
+# --- 开发/打包依赖（以下为 dev，部署时无需） ---
+# pyinstaller>=6.0

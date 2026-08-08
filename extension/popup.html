@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 300px;
+      margin: 0;
+      padding: 14px;
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #0A1930;
+      color: #E6EDF3;
+    }
+    h1 {
+      font-size: 14px;
+      margin: 0 0 4px 0;
+      color: #4D6BFD;
+    }
+    .sub {
+      font-size: 11px;
+      color: #8B949E;
+      margin-bottom: 12px;
+    }
+    button {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      background: #4D6BFD;
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { background: #5F7BFF; }
+    button:disabled { background: #2A3B6B; color: #8B949E; cursor: default; }
+    #status {
+      margin-top: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #8B949E;
+      white-space: pre-wrap;
+    }
+    .ok { color: #7C96FF; }
+    .err { color: #FF6B6B; }
+    .tip { font-size: 11px; color: #8B949E; margin-top: 10px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>OpenCode GO Cookie 捕获</h1>
+  <div class="sub">读取 opencode.ai 的 auth Cookie，发送给本机监控程序</div>
+  <button id="capture">捕获 Cookie 并发送</button>
+  <div id="status"></div>
+  <div class="tip">前提：① 本机已运行 OpenCode GO 用量监控程序
+    ② 已在浏览器登录 opencode.ai</div>
+  <script src="popup.js"></script>
+</body>
+</html>

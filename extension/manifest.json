@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "OpenCode GO Cookie 捕获",
+  "version": "1.2",
+  "description": "读取 opencode.ai 的 auth cookie 并发送给本机 OpenCode GO 用量监控程序（127.0.0.1:8900）。",
+  "permissions": ["cookies"],
+  "host_permissions": ["https://opencode.ai/*", "http://127.0.0.1:8900/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "OpenCode GO Cookie 捕获"
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
