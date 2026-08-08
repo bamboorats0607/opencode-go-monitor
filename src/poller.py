@@ -19,10 +19,12 @@ from src.parser import parse_rows
 
 
 class DBPoller(threading.Thread):
-    def __init__(self, db_path: str | None = None, interval_ms: int = 500):
+    def __init__(self, db_path: str | None = None, interval_ms: int = 500,
+                 store: "object | None" = None):
         super().__init__(name="db-poller", daemon=True)
         self.db_path = db_path  # 供 UI（统计面板等）展示数据源路径
         self._db_path = db_path
+        self._store = store  # LocalStore：在线明细异步持久化（后台线程写）
         self._interval = max(0.1, interval_ms / 1000.0)
         self._lock = threading.Lock()
         self._stop = False
@@ -30,6 +32,9 @@ class DBPoller(threading.Thread):
         self._snapshot: dict | None = None
         self._ready = threading.Event()
         self._error: str | None = None
+        # 异步写队列：主线程只入队，写入由本线程消费执行
+        self._pending_lock = threading.Lock()
+        self._pending: list[list] = []
 
     # ---------- 主线程调用 ----------
     def stop(self) -> None:
@@ -47,6 +52,13 @@ class DBPoller(threading.Thread):
             s = self._snapshot
             self._snapshot = None
             return s
+
+    def submit(self, records: list) -> None:
+        """异步提交在线明细写入：仅入队，返回立即（写入由后台线程执行）。"""
+        if not records or self._store is None:
+            return
+        with self._pending_lock:
+            self._pending.append(list(records))
 
     def wait_ready(self, timeout: float = 10.0) -> bool:
         """等待首载完成（首次快照发布）。"""
@@ -74,11 +86,32 @@ class DBPoller(threading.Thread):
             try:
                 rows = w.poll(force=force)
                 if not rows and not force:
+                    self._drain_store()
                     continue
                 self._publish("inc", parse_rows(rows), w.fetch_sessions())
             except Exception as e:
                 self._error = str(e)
                 self._publish("error", [], [])
+            self._drain_store()
+
+    def _drain_store(self) -> None:
+        """消费异步写队列：在线明细写入 LocalStore（含 30 日 LRU 淘汰）。
+
+        写入失败只记日志，不影响轮询主流程；下一轮 pending 清空，
+        失败批不会重试（数据幂等，后续增量会再拉取）。
+        """
+        if self._store is None:
+            return
+        with self._pending_lock:
+            if not self._pending:
+                return
+            batch = self._pending
+            self._pending = []
+        for chunk in batch:
+            try:
+                self._store.upsert_records(chunk)
+            except Exception as e:
+                self._error = f"store write failed: {e}"
 
     def _publish(self, kind: str, msgs: list, sessions: list) -> None:
         with self._lock:

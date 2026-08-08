@@ -54,9 +54,10 @@ from src.ui.settings_dialog import SettingsDialog
 from src.ui.stats_dialog import StatsDialog
 
 # ---- V2 新模块（T0/T1/T2 并行产出）----
-from src.core.settings import AppSettings
+from src.core.settings import AppSettings, _PROJECT_ROOT
 from src.core.port_manager import PortManager
 from src.diagnostics.score import compute_score, detect_features
+from src.local_store import LocalStore
 
 try:
     from src.diagnostics.alerts import AlertManager
@@ -185,6 +186,29 @@ def _session_model_label(model_json: str | None) -> str:
         return obj.get("id") or obj.get("modelID") or model_json[:24]
     except Exception:
         return model_json[:24]
+
+
+def _go_rec_to_usage(r: dict) -> dict:
+    """在线调用明细（go_usage_list 原始字段）→ 统一统计字段。
+
+    与 LocalStore 存储口径一致：time_created 毫秒、cost 已 ÷1e8 换算为美元。
+    """
+    try:
+        ts = datetime.fromisoformat(r["timeCreated"].replace("Z", "+00:00"))
+        ts_ms = int(ts.timestamp() * 1000)
+    except Exception:
+        ts_ms = 0
+    return {
+        "id": r["id"],
+        "time_created": ts_ms,
+        "modelID": r["model"] or "?",
+        "tokens_input": int(r["inputTokens"] or 0),
+        "tokens_output": int(r["outputTokens"] or 0),
+        "cache_read": int(r["cacheReadTokens"] or 0),
+        "cache_write": int(r.get("cacheWrite5mTokens") or r.get("cacheWrite1hTokens") or 0),
+        "cost": float(r.get("cost") or 0) / 100_000_000,
+        "session_id": r.get("sessionID") or "unknown",
+    }
 
 
 class KpiRing(QWidget):
@@ -342,8 +366,16 @@ class MainWindow(QMainWindow):
 
         self._setup_logging()
 
+        # 在线明细持久化（独立 SQLite，30 日 LRU 淘汰；写入由轮询后台线程异步执行）
+        store_path = os.path.join(_PROJECT_ROOT, "data", "usage.db")
+        try:
+            self.local_store = LocalStore(store_path)
+        except Exception as e:
+            self.local_store = None
+            logger.warning("local_store init failed: %s", e)
         # 异步轮询：DBWatcher/sqlite 连接独占后台线程，主线程只消费快照渲染
-        self.poller = DBPoller(db_path, int(all_s["refresh_interval_ms"]))
+        self.poller = DBPoller(
+            db_path, int(all_s["refresh_interval_ms"]), store=self.local_store)
         self.msgs: list[dict] = []
         self.sessions: list = []
         self._tick_count = 0
@@ -551,6 +583,8 @@ class MainWindow(QMainWindow):
             self.go_status_text = (
                 f"在线额度已连接 · 全量调用 {len(self.go_usage_list)} 条"
                 "（含 opencode CLI / Trae 等所有客户端）")
+            # 异步持久化：仅入队，写入由轮询后台线程执行（30 日 LRU 淘汰）
+            self.poller.submit([_go_rec_to_usage(r) for r in new_recs])
         elif r.get("usage_ok") is not None and not r["usage_ok"]:
             self._go_usage_ok = False
         if go_data is None and not new_recs and r.get("ok"):
@@ -1317,9 +1351,10 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _open_stats_dialog(self):
-        """统计面板：天/周/月周期统计 + 选择位置导出（数据按需计算，不进轮询）。"""
+        """统计面板：本地 db + 在线持久化（30 天）双数据源周期统计 + 导出。"""
+        online = self.local_store.fetch_records() if self.local_store else []
         dlg = StatsDialog(
-            self.msgs, self._recent_alerts, parent=self,
+            self.msgs, online, self._recent_alerts, parent=self,
             db_path=getattr(self.poller, "db_path", ""))
         dlg.exec()
 
@@ -1378,6 +1413,11 @@ class MainWindow(QMainWindow):
         self._quitting = True
         try:
             self.poller.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "local_store", None):
+                self.local_store.close()
         except Exception:
             pass
         if self._watchdog:
