@@ -1239,13 +1239,14 @@ class MainWindow(QMainWindow):
         """最近请求表格（分页加载，防全量加载 OOM）。
 
         数据源优先级（统一字段，单一路径）：
-          1) 在线持久化库（30 天，OFFSET 分页查询）——默认
-          2) 实时在线明细（cookie 有效时）——持久化未就绪兜底
+          1) 在线内存实时明细（go_usage_list）——最新拉取即时可见
+          2) 在线持久化库（30 天，OFFSET 分页查询）——内存未就绪兜底
           3) 本地 opencode.db 消息——在线不可用时回退
-        每次刷新渲染第一页；滚动到底由 _on_msg_scroll 追加下一页。
+        每次刷新清空并渲染第一页；滚动到底由 _on_msg_scroll 追加下一页。
         """
         t = self.table_msgs
         self._msg_page = 0
+        t.setRowCount(0)   # 先清空，避免轮询刷新时重复追加堆积
         self._append_msg_page()
 
     def _msg_min_time(self) -> int | None:
