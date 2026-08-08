@@ -46,6 +46,7 @@ class AppSettings:
         "consecutive_critical": 3,       # 连续 critical 次数上限
     }
     DEFAULT_NOTIFICATIONS_ENABLED = True   # 托盘气泡通知开关
+    DEFAULT_CLOSE_TO_TRAY = True           # 关闭窗口时驻留托盘；False=直接退出（释放单实例锁）
     DEFAULT_LOG_FILE = os.path.join(_PROJECT_ROOT, "logs", "opencode-monitor.log")
     DEFAULT_LOG_BACKUP_DAYS = 7
 
@@ -59,6 +60,7 @@ class AppSettings:
         "time_range": DEFAULT_TIME_RANGE,
         "thresholds": DEFAULT_THRESHOLDS,
         "notifications_enabled": DEFAULT_NOTIFICATIONS_ENABLED,
+        "close_to_tray": DEFAULT_CLOSE_TO_TRAY,
         "log_file": DEFAULT_LOG_FILE,
         "log_backup_days": DEFAULT_LOG_BACKUP_DAYS,
     }

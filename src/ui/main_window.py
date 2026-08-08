@@ -22,6 +22,7 @@ import logging
 import os
 import queue
 import sys
+import threading
 import time
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
@@ -324,6 +325,7 @@ class MainWindow(QMainWindow):
         self.workspace_id = all_s["workspace_id"]
         self.time_range = all_s["time_range"]
         self.notifications_enabled = bool(all_s["notifications_enabled"])
+        self.close_to_tray = bool(all_s["close_to_tray"])
         self.log_file = str(all_s["log_file"])
         self.log_backup_days = int(all_s["log_backup_days"])
 
@@ -350,6 +352,8 @@ class MainWindow(QMainWindow):
         self.go_status_text = "未连接在线额度（可在设置中启用代理自动捕获 Cookie）"
         self._cookie_last_status: int | None = None
         self._cookie_queue: "queue.Queue[str]" = queue.Queue()
+        self._go_usage_queue: "queue.Queue[dict]" = queue.Queue()  # 后台拉取结果回主线程
+        self._go_refreshing = False
         self._health_db = 1.0
         self._health_api = 1.0
         self._health_sse = 1.0
@@ -474,44 +478,82 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"代理启动失败：端口 {port} 被占用")
 
     def _refresh_go_usage(self):
-        """拉取 go 用量（自动优先用已保存 cookie，失败静默降级）。
+        """拉取 go 用量（后台线程执行，避免阻塞 UI 主线程）。
 
         go 页面 → 三窗口额度；usage 页面 → 全部客户端（opencode CLI/Trae 等）
         走 go 订阅网关的调用明细，作为"最近请求"表格的在线数据源。
+        网络请求在 daemon 线程跑，结果经 _go_usage_queue 回主线程应用。
         """
-        cookie = self.app_settings.get("cookie", "")
-        if not cookie:
-            self.go_status_text = "未配置 Cookie：启用代理捕获或手动粘贴后自动拉取"
-            self._update_go_cards()
-            return
-        ok, payload, status = fetch_go_page(cookie, self.workspace_id)
-        if ok:
-            self.go_data = parse_go_page(payload)
+        if getattr(self, "_go_refreshing", False):
+            return  # 上一轮未结束则跳过（防重入，避免主线程堆积）
+        self._go_refreshing = True
+        threading.Thread(target=self._go_fetch_worker, daemon=True).start()
+
+    def _go_fetch_worker(self):
+        """后台线程：发网络请求 + 解析，结果入队回主线程。"""
+        try:
+            cookie = self.app_settings.get("cookie", "")
+            if not cookie:
+                self._go_usage_queue.put({
+                    "ok": True, "go_data": None, "new_recs": [],
+                    "status_text": "未配置 Cookie：启用代理捕获或手动粘贴后自动拉取",
+                    "status": None,
+                })
+                return
+            ok, payload, status = fetch_go_page(cookie, self.workspace_id)
+            go_data = parse_go_page(payload) if ok else None
+            status_text = payload  # 失败时 payload 即原因文本
+            ok2, html2, _status2 = fetch_usage_page(cookie, self.workspace_id)
+            new_recs = parse_usage_list(html2) if ok2 else []
+            self._go_usage_queue.put({
+                "ok": ok, "go_data": go_data, "new_recs": new_recs,
+                "status_text": status_text, "status": status,
+                "usage_ok": ok2,
+            })
+        except Exception as e:
+            self._go_usage_queue.put({
+                "ok": False, "go_data": None, "new_recs": [],
+                "status_text": f"在线拉取异常：{e}", "status": None,
+            })
+        finally:
+            self._go_refreshing = False
+
+    def _drain_go_queue(self):
+        """主线程轮询：应用后台拉取结果并更新 UI（由 _tick 调用）。"""
+        try:
+            while True:
+                r = self._go_usage_queue.get_nowait()
+                self._apply_go_result(r)
+        except Exception:
+            pass  # queue.Empty
+
+    def _apply_go_result(self, r: dict):
+        go_data = r.get("go_data")
+        if go_data is not None:
+            self.go_data = go_data
             self._cookie_last_status = 200
             self._health_api = 1.0
             self.banner_cookie.setVisible(False)
         else:
+            status = r.get("status")
             self.go_data = None
             self._cookie_last_status = status
-            self.go_status_text = payload  # 含失效提示
+            self.go_status_text = r.get("status_text", "")
             if status in (401, 403):
                 self._health_api = 0.0
                 self.banner_cookie.setVisible(True)
-        # 在线调用明细（全部客户端，含 Trae）：增量合并到 go_usage_list
-        ok2, html2, _status2 = fetch_usage_page(cookie, self.workspace_id)
-        if ok2:
-            new_recs = parse_usage_list(html2)
-            if new_recs:
-                self.go_usage_list = merge_incremental(
-                    getattr(self, "go_usage_list", []), new_recs)
-                self._go_usage_ok = True
-                self.go_status_text = (
-                    f"在线额度已连接 · 全量调用 {len(self.go_usage_list)} 条"
-                    "（含 opencode CLI / Trae 等所有客户端）")
-            else:
-                self._go_usage_ok = False
-        else:
+        new_recs = r.get("new_recs") or []
+        if new_recs:
+            self.go_usage_list = merge_incremental(
+                getattr(self, "go_usage_list", []), new_recs)
+            self._go_usage_ok = True
+            self.go_status_text = (
+                f"在线额度已连接 · 全量调用 {len(self.go_usage_list)} 条"
+                "（含 opencode CLI / Trae 等所有客户端）")
+        elif r.get("usage_ok") is not None and not r["usage_ok"]:
             self._go_usage_ok = False
+        if go_data is None and not new_recs and r.get("ok"):
+            self.go_status_text = r.get("status_text", self.go_status_text)
         self._update_go_cards()
         self._update_msg_table()
 
@@ -794,6 +836,7 @@ class MainWindow(QMainWindow):
         if self._quitting:
             return
         self._drain_cookie_queue()
+        self._drain_go_queue()
         try:
             rows = self.watcher.poll()
         except Exception:
@@ -850,7 +893,7 @@ class MainWindow(QMainWindow):
                     "session_id": r["sessionID"] or "unknown",
                     "id": r["id"],
                     "modelID": r["model"],
-                    "cost": r["cost"] / 1_000_000,
+                    "cost": r["cost"] / 100_000_000,
                 })
             return out
         return self._filter_by_range()
@@ -1009,7 +1052,7 @@ class MainWindow(QMainWindow):
             cr = sum(r["cacheReadTokens"] for r in self.go_usage_list)
             cost = sum(r["cost"] for r in self.go_usage_list)
             self.kpi_token.setText(_fmt_tokens(ti + cr))
-            self.kpi_cost.setText(f"${cost / 1_000_000:,.4f}")
+            self.kpi_cost.setText(f"${cost / 100_000_000:,.4f}")
             return
         ti = sum(s[6] or 0 for s in self.sessions)
         cost = sum(s[5] or 0 for s in self.sessions)
@@ -1134,7 +1177,8 @@ class MainWindow(QMainWindow):
             for row, r in enumerate(ordered):
                 t.insertRow(row)
                 is_low = id(r) in low_set
-                ts = datetime.fromisoformat(r["timeCreated"].replace("Z", "+00:00"))
+                # timeCreated 为 UTC（new Date("...Z")），转本地时区显示
+                ts = datetime.fromisoformat(r["timeCreated"].replace("Z", "+00:00")).astimezone()
                 vals = [
                     ts.strftime("%m-%d %H:%M:%S"),
                     r["model"],
@@ -1257,6 +1301,8 @@ class MainWindow(QMainWindow):
             self.time_range = str(new_settings.get("time_range", self.time_range))
             self.notifications_enabled = bool(new_settings.get(
                 "notifications_enabled", self.notifications_enabled))
+            self.close_to_tray = bool(new_settings.get(
+                "close_to_tray", self.close_to_tray))
             self.log_backup_days = int(new_settings.get(
                 "log_backup_days", self.log_backup_days))
             pool = new_settings.get("proxy_port_pool")
@@ -1317,6 +1363,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent):
         if self._quitting or not self.tray.isVisible():
+            event.accept()
+            return
+        if not self.close_to_tray:
+            # 设置「直接退出」：释放单实例锁，避免旧进程挡住新版本启动
+            self._really_quit()
             event.accept()
             return
         self.hide()

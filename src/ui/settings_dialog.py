@@ -42,6 +42,7 @@ DEFAULT_SETTINGS: dict = {
         "consecutive_critical": 3,    # 连续告警条数才升级为 critical
     },
     "notifications_enabled": True,
+    "close_to_tray": True,            # 关闭窗口时驻留托盘；False=直接退出（释放单实例锁）
     "log_file": "logs/opencode-go-monitor.log",
     "log_backup_days": 7,             # 按天滚动，保留 7 天（与 spec 一致）
 }
@@ -276,6 +277,13 @@ class SettingsDialog(QDialog):
         tip.setStyleSheet("color: #8b949e; font-size: 12px;")
         tip.setWordWrap(True)
         lay.addWidget(tip)
+        self.chk_close_to_tray = QCheckBox("关闭窗口时最小化到系统托盘（不勾选 = 直接退出程序）")
+        lay.addWidget(self.chk_close_to_tray)
+        tip2 = QLabel("勾选后点窗口 X 仅隐藏到托盘，进程继续驻留（保持运行、可接收告警）；"
+                      "不勾选则点 X 直接退出并释放单实例锁，避免旧进程挡住新版本启动。")
+        tip2.setStyleSheet("color: #8b949e; font-size: 12px;")
+        tip2.setWordWrap(True)
+        lay.addWidget(tip2)
         lay.addStretch(1)
         return w
 
@@ -332,6 +340,9 @@ class SettingsDialog(QDialog):
         data["notifications_enabled"] = _as_bool(
             s.value("notifications_enabled", data["notifications_enabled"]),
             data["notifications_enabled"])
+        data["close_to_tray"] = _as_bool(
+            s.value("close_to_tray", data["close_to_tray"]),
+            data["close_to_tray"])
         data["log_file"] = s.value("log_file", data["log_file"]) or data["log_file"]
         data["log_backup_days"] = int(s.value("log_backup_days", data["log_backup_days"]))
         return data
@@ -355,6 +366,7 @@ class SettingsDialog(QDialog):
         self.sp_miss_ratio.setValue(float(th.get("miss_ratio", 0.01)))
         self.sp_consecutive.setValue(int(th.get("consecutive_critical", 3)))
         self.chk_notify.setChecked(_as_bool(data.get("notifications_enabled", True), True))
+        self.chk_close_to_tray.setChecked(_as_bool(data.get("close_to_tray", True), True))
         self.ed_log_file.setText(str(data.get("log_file", "")))
         self.sp_backup_days.setValue(int(data.get("log_backup_days", 7)))
 
@@ -384,6 +396,7 @@ class SettingsDialog(QDialog):
                 "consecutive_critical": self.sp_consecutive.value(),
             },
             "notifications_enabled": self.chk_notify.isChecked(),
+            "close_to_tray": self.chk_close_to_tray.isChecked(),
             "log_file": self.ed_log_file.text().strip(),
             "log_backup_days": self.sp_backup_days.value(),
         }
@@ -400,6 +413,7 @@ class SettingsDialog(QDialog):
         for k, v in data["thresholds"].items():
             s.setValue(_TH_KEY[k], v)
         s.setValue("notifications_enabled", data["notifications_enabled"])
+        s.setValue("close_to_tray", data["close_to_tray"])
         s.setValue("log_file", data["log_file"])
         s.setValue("log_backup_days", data["log_backup_days"])
         s.sync()

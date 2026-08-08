@@ -114,10 +114,15 @@ def hit_rate(rec: dict) -> float | None:
 
 
 def fmt_cost(cost: float) -> str:
-    """微单位成本显示（cost 为微单位，如 109823 → $0.11）。"""
+    """成本显示。SSR 实测 cost 字段单位 = 1e-8 美元（如 128422 → $0.00128）。
+
+    注：曾误按 1e-6（微美元）换算导致 ×100 显示错误，实测单条
+    input=321 tokens 的 deepseek-v4-flash 请求 cost=128422 → $0.00128 合理，
+    而 /1e6 得 $0.128 明显不合理，故确定为 1e-8 美元。
+    """
     if cost <= 0:
         return "—"
-    return f"${cost / 1_000_000:.4f}"
+    return f"${cost / 100_000_000:.4f}"
 
 
 def merge_incremental(prev: list[dict], new: list[dict], max_len: int = 5000) -> list[dict]:

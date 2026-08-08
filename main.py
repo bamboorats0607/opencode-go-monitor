@@ -62,7 +62,12 @@ def main():
     lock = _try_acquire_lock()
     _trace(f"lock acquired={lock is not None}")
     if lock is None:
-        QMessageBox.warning(None, "OpenCode GO 用量监控", "程序已在运行，请勿重复启动。")
+        QMessageBox.warning(
+            None, "OpenCode GO 用量监控",
+            "程序已在运行（可能驻留在系统托盘）。\n\n"
+            "如需启动新版本，请先右键托盘鲸鱼图标选择「退出」，"
+            "再重新启动本程序。",
+        )
         sys.exit(1)
 
     try:
