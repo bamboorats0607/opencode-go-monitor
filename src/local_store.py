@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     model        TEXT,
     tokens_input INTEGER NOT NULL DEFAULT 0,
     tokens_output INTEGER NOT NULL DEFAULT 0,
+    tokens_reasoning INTEGER NOT NULL DEFAULT 0,
     cache_read   INTEGER NOT NULL DEFAULT 0,
     cache_write  INTEGER NOT NULL DEFAULT 0,
     cost         REAL NOT NULL DEFAULT 0,
@@ -35,6 +36,11 @@ CREATE TABLE IF NOT EXISTS usage_records (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_records(time_created);
 """
+
+# 老库升级：缺失列补加（幂等）
+_MIGRATIONS = [
+    ("tokens_reasoning", "ALTER TABLE usage_records ADD COLUMN tokens_reasoning INTEGER NOT NULL DEFAULT 0"),
+]
 
 
 class LocalStore:
@@ -49,6 +55,10 @@ class LocalStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(usage_records)").fetchall()}
+            for col, ddl in _MIGRATIONS:
+                if col not in cols:
+                    self._conn.execute(ddl)
             self._conn.commit()
 
     def close(self) -> None:
@@ -71,14 +81,15 @@ class LocalStore:
                 cur = self._conn.executemany(
                     "INSERT OR IGNORE INTO usage_records "
                     "(id, time_created, model, tokens_input, tokens_output, "
-                    " cache_read, cache_write, cost, session_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " tokens_reasoning, cache_read, cache_write, cost, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [(
                         r.get("id"),
                         int(r.get("time_created") or 0),
                         (r.get("modelID") or "")[:64],
                         int(r.get("tokens_input") or 0),
                         int(r.get("tokens_output") or 0),
+                        int(r.get("tokens_reasoning") or 0),
                         int(r.get("cache_read") or 0),
                         int(r.get("cache_write") or 0),
                         float(r.get("cost") or 0),
@@ -108,7 +119,7 @@ class LocalStore:
             try:
                 cur = self._conn.execute(
                     "SELECT id, time_created, model, tokens_input, tokens_output, "
-                    "       cache_read, cache_write, cost, session_id "
+                    "       tokens_reasoning, cache_read, cache_write, cost, session_id "
                     "FROM usage_records ORDER BY time_created DESC LIMIT ?",
                     (limit,))
                 return [
@@ -118,10 +129,11 @@ class LocalStore:
                         "modelID": row[2],
                         "tokens_input": row[3],
                         "tokens_output": row[4],
-                        "cache_read": row[5],
-                        "cache_write": row[6],
-                        "cost": row[7],
-                        "session_id": row[8],
+                        "tokens_reasoning": row[5],
+                        "cache_read": row[6],
+                        "cache_write": row[7],
+                        "cost": row[8],
+                        "session_id": row[9],
                     }
                     for row in cur.fetchall()
                 ]

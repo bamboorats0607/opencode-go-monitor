@@ -170,7 +170,11 @@ class StatsDialog(QDialog):
         for key, table in self.period_tables.items():
             table.setRowCount(0)
             rows = self._stats.get(key) or []
-            for label, agg, cnt in rows:
+            for item in rows:
+                if len(item) >= 3:
+                    label, agg, cnt = item[0], item[1], item[2]
+                else:  # 防御：旧格式二元组
+                    label, agg, cnt = item[0], item[1], 0
                 r = table.rowCount()
                 table.insertRow(r)
                 values = [

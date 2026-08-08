@@ -56,12 +56,14 @@ def aggregate_by_period(msgs: list[dict], period: str) -> list[tuple]:
 
 
 def build_period_stats(msgs: list[dict], alerts: list[dict] | None = None) -> dict:
-    """三个周期维度统计。alerts 可选，用于给每个周期附加告警数。"""
+    """三个周期维度统计。始终返回统一三元组 [(label, agg, alert_count), ...]。
+
+    alerts 可选；缺省时告警数一律为 0，保证调用方解包格式稳定。
+    """
     stats = {p: aggregate_by_period(msgs, p) for p in PERIODS}
-    if alerts:
-        for p in PERIODS:
-            counts = _period_of_alerts(alerts, p)
-            stats[p] = [(label, agg, counts.get(label, 0)) for label, agg in stats[p]]
+    for p in PERIODS:
+        counts = _period_of_alerts(alerts, p) if alerts else {}
+        stats[p] = [(label, agg, counts.get(label, 0)) for label, agg in stats[p]]
     return stats
 
 

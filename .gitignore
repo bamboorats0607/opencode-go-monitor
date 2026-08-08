@@ -13,6 +13,7 @@ dist/
 # 日志与运行时数据
 logs/
 *.log
+data/
 
 # IDE
 .idea/

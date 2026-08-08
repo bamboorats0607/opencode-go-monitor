@@ -42,10 +42,7 @@ from src.watcher import opencode_running, probe_sse
 from src.poller import DBPoller
 from src.usage_api import fetch_go_page, fetch_usage_page, validate_cookie
 from src.go_usage import parse_go_page, fmt_window, fmt_reset_secs
-from src.go_usage_list import (
-    parse_usage_list, merge_incremental, fmt_cost,
-    hit_rate as online_hit_rate,
-)
+from src.go_usage_list import parse_usage_list, merge_incremental
 from src.proxy_capture import LocalProxy, set_cookie_callback
 from src.cookie_receiver import CookieReceiver, set_cookie_callback as set_receiver_callback
 from src.ui.whale_svg import WHALE_SVG
@@ -204,6 +201,7 @@ def _go_rec_to_usage(r: dict) -> dict:
         "modelID": r["model"] or "?",
         "tokens_input": int(r["inputTokens"] or 0),
         "tokens_output": int(r["outputTokens"] or 0),
+        "tokens_reasoning": int(r.get("reasoningTokens") or 0),
         "cache_read": int(r["cacheReadTokens"] or 0),
         "cache_write": int(r.get("cacheWrite5mTokens") or r.get("cacheWrite1hTokens") or 0),
         "cost": float(r.get("cost") or 0) / 100_000_000,
@@ -834,6 +832,8 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         # 日志面板
         self.log_panel = LogPanel()
+        # 挂到 root logger：所有模块日志（继承 root handlers）进 UI 面板
+        self.log_panel.connect_handler(logging.getLogger(), level=logging.INFO)
         tabs.addTab(self.log_panel, "日志")
         # 多维聚合
         agg_w = QWidget()
@@ -928,30 +928,30 @@ class MainWindow(QMainWindow):
 
     # ---------- 时间范围过滤 ----------
     def _diagnosis_source(self) -> list[dict]:
-        """诊断数据源：在线全量调用（含 Trae）优先，本地 db 回退。
+        """诊断数据源：在线全量调用（持久化库→实时，含 Trae）优先，本地 db 回退。
 
-        在线记录字段转换为诊断引擎字段（tokens_input/cache_read/cache_write/
-        time_created/session_id/id），并按 self.time_range 过滤。
+        统一字段与诊断引擎口径一致（tokens_input/cache_read/cache_write/
+        time_created/session_id/id/modelID/cost），并按 self.time_range 过滤。
         """
-        if self._go_usage_ok and self.go_usage_list:
+        online = self._online_source()
+        if online:
             ms = TIME_RANGE_MS.get(self.time_range)
             now = int(time.time() * 1000)
             out = []
-            for r in self.go_usage_list:
-                ts = datetime.fromisoformat(r["timeCreated"].replace("Z", "+00:00"))
-                ts_ms = int(ts.timestamp() * 1000)
+            for r in online:
+                ts_ms = r.get("time_created") or 0
                 if ms and ts_ms < now - ms:
                     continue
                 out.append({
-                    "tokens_input": r["inputTokens"],
-                    "tokens_output": r["outputTokens"],
-                    "cache_read": r["cacheReadTokens"],
-                    "cache_write": int(r["cacheWrite5mTokens"] or r["cacheWrite1hTokens"] or 0),
+                    "tokens_input": r["tokens_input"],
+                    "tokens_output": r["tokens_output"],
+                    "cache_read": r["cache_read"],
+                    "cache_write": r["cache_write"],
                     "time_created": ts_ms,
-                    "session_id": r["sessionID"] or "unknown",
+                    "session_id": r["session_id"],
                     "id": r["id"],
-                    "modelID": r["model"],
-                    "cost": r["cost"] / 100_000_000,
+                    "modelID": r["modelID"],
+                    "cost": r["cost"],
                 })
             return out
         return self._filter_by_range()
@@ -966,6 +966,30 @@ class MainWindow(QMainWindow):
         now = int(time.time() * 1000)
         cutoff = now - ms
         return [m for m in self.msgs if (m.get("time_created") or 0) >= cutoff]
+
+    def _online_source(self) -> list[dict]:
+        """在线数据源（统一字段口径）：持久化库（30 天，启动即有历史）优先。
+
+        返回字段：id/time_created(ms)/modelID/tokens_input/tokens_output/
+        tokens_reasoning/cache_read/cache_write/cost/session_id。
+        LocalStore 为在线明细的本地镜像（后台线程异步写入），启动即可读取历史，
+        不依赖首次在线拉取完成；实时拉取结果经内存 go_usage_list 兜底。
+        """
+        try:
+            if getattr(self, "local_store", None):
+                recs = self.local_store.fetch_records()
+                if recs:
+                    return recs
+        except Exception:
+            pass
+        if self._go_usage_ok and self.go_usage_list:
+            return [_go_rec_to_usage(r) for r in self.go_usage_list]
+        return []
+
+    def _agg_source(self) -> list[dict]:
+        """聚合表格数据源：在线（持久化库→实时）优先，本地 db 回退。"""
+        recs = self._online_source()
+        return recs if recs else self.msgs
 
     def _on_range_changed(self, btn):
         mapping = {self.btn_range_24: "24h", self.btn_range_7d: "7d", self.btn_range_30d: "30d"}
@@ -1103,14 +1127,15 @@ class MainWindow(QMainWindow):
 
     # ---------- KPI / 表格更新 ----------
     def _update_kpi(self):
-        if self._go_usage_ok and self.go_usage_list:
-            # 在线全量（含 Trae 等所有客户端）
-            ti = sum(r["inputTokens"] for r in self.go_usage_list)
-            to = sum(r["outputTokens"] for r in self.go_usage_list)
-            cr = sum(r["cacheReadTokens"] for r in self.go_usage_list)
-            cost = sum(r["cost"] for r in self.go_usage_list)
+        online = self._online_source()
+        if online:
+            # 在线全量（含 Trae 等所有客户端，持久化库优先）
+            ti = sum(r["tokens_input"] for r in online)
+            to = sum(r["tokens_output"] for r in online)
+            cr = sum(r["cache_read"] for r in online)
+            cost = sum(r["cost"] for r in online)
             self.kpi_token.setText(_fmt_tokens(ti + cr))
-            self.kpi_cost.setText(f"${cost / 100_000_000:,.4f}")
+            self.kpi_cost.setText(f"${cost:,.4f}")
             return
         ti = sum(s[6] or 0 for s in self.sessions)
         cost = sum(s[5] or 0 for s in self.sessions)
@@ -1163,7 +1188,7 @@ class MainWindow(QMainWindow):
         t = self.table_models
         t.setRowCount(0)
         t.setUpdatesEnabled(False)
-        for row, (model, agg) in enumerate(aggregate_by_model(self.msgs)):
+        for row, (model, agg) in enumerate(aggregate_by_model(self._agg_source())):
             t.insertRow(row)
             vals = [
                 model,
@@ -1185,7 +1210,7 @@ class MainWindow(QMainWindow):
         t = self.table_windows
         t.setRowCount(0)
         t.setUpdatesEnabled(False)
-        for row, (b, agg) in enumerate(reversed(aggregate_by_window(self.msgs))):
+        for row, (b, agg) in enumerate(reversed(aggregate_by_window(self._agg_source()))):
             t.insertRow(row)
             vals = [
                 datetime.fromtimestamp(b).strftime("%m-%d %H:00"),
@@ -1204,68 +1229,29 @@ class MainWindow(QMainWindow):
     def _update_msg_table(self):
         """最近请求表格：时间/模型/输入/缓存命中/输出/命中率/成本。
 
-        数据源优先级：
-          1) go 订阅在线明细（usage.list，覆盖所有客户端含 Trae）——cookie 有效时
-          2) 本地 opencode.db 消息（仅 opencode CLI 客户端）——在线不可用时回退
+        数据源优先级（统一字段，单一路径）：
+          1) 在线持久化库（30 天，覆盖所有客户端含 Trae）——默认
+          2) 实时在线明细（cookie 有效时）——持久化未就绪兜底
+          3) 本地 opencode.db 消息（仅 opencode CLI 客户端）——在线不可用时回退
         """
         t = self.table_msgs
         low_input = int(self.thresholds.get("suspicious_input_min", DEFAULT_LOW_INPUT))
         miss_ratio = float(self.thresholds.get("miss_ratio", DEFAULT_MISS_RATIO))
 
-        online = self._go_usage_ok and self.go_usage_list
-        if online:
-            # 在线明细：按时间过滤 + 低命中标红置顶
-            ms = TIME_RANGE_MS.get(self.time_range)
+        recs = self._agg_source()
+        # 按时间范围过滤（统一字段 time_created 毫秒）
+        ms = TIME_RANGE_MS.get(self.time_range)
+        if ms:
             now = int(time.time() * 1000)
-            recs = self.go_usage_list
-            if ms:
-                cutoff = now - ms
-                recs = [r for r in recs
-                        if (datetime.fromisoformat(r["timeCreated"].replace("Z", "+00:00"))
-                            .timestamp() * 1000) >= cutoff]
-            low = [r for r in recs
-                   if r["inputTokens"] > low_input
-                   and (r["cacheReadTokens"] / r["inputTokens"]) < miss_ratio]
-            normal = [r for r in recs if r not in low]
-            ordered = (low + normal)[:200]
-            low_set = set(id(r) for r in low)
-
-            t.setRowCount(0)
-            t.setUpdatesEnabled(False)
-            for row, r in enumerate(ordered):
-                t.insertRow(row)
-                is_low = id(r) in low_set
-                # timeCreated 为 UTC（new Date("...Z")），转本地时区显示
-                ts = datetime.fromisoformat(r["timeCreated"].replace("Z", "+00:00")).astimezone()
-                vals = [
-                    ts.strftime("%m-%d %H:%M:%S"),
-                    r["model"],
-                    _fmt_tokens(r["inputTokens"]),
-                    _fmt_tokens(r["cacheReadTokens"]),
-                    _fmt_tokens(r["outputTokens"]),
-                    f"{online_hit_rate(r) * 100:.1f}%" if online_hit_rate(r) is not None else "—",
-                    fmt_cost(r["cost"]),
-                ]
-                for col, v in enumerate(vals):
-                    item = QTableWidgetItem(str(v))
-                    if is_low:
-                        item.setForeground(QColor(RED))
-                        item.setBackground(QColor("#3d1a1a"))
-                    elif col in (3, 5):
-                        item.setForeground(QColor(BLUE))
-                    t.setItem(row, col, item)
-            t.setUpdatesEnabled(True)
-            return
-
-        filtered = self._filter_by_range()
+            recs = [r for r in recs if (r.get("time_created") or 0) >= now - ms]
 
         # 低命中标红置顶（沿用 V1 语义，用比例阈值）
-        low = [m for m in filtered
+        low = [m for m in recs
                if m["tokens_input"] > low_input
                and (m["cache_read"] / m["tokens_input"]) < miss_ratio]
-        normal = [m for m in filtered if m not in low]
-        low.sort(key=lambda m: -m["time_created"])
-        normal.sort(key=lambda m: -m["time_created"])
+        normal = [m for m in recs if m not in low]
+        low.sort(key=lambda m: -(m.get("time_created") or 0))
+        normal.sort(key=lambda m: -(m.get("time_created") or 0))
         ordered = (low + normal)[:200]  # 只显示最近 200 条
         low_set = set(id(m) for m in low)
 
@@ -1274,13 +1260,14 @@ class MainWindow(QMainWindow):
         for row, m in enumerate(ordered):
             t.insertRow(row)
             is_low = id(m) in low_set
+            hit = hit_rate(m["cache_read"], m["tokens_input"])
             vals = [
                 _fmt_time(m["time_created"]),
                 m["modelID"] or "",
                 _fmt_tokens(m["tokens_input"]),
                 _fmt_tokens(m["cache_read"]),
                 _fmt_tokens(m["tokens_output"]),
-                f"{hit_rate(m['cache_read'], m['tokens_input']) * 100:.1f}%",
+                f"{hit * 100:.1f}%",
                 f"${m['cost']:,.4f}",
             ]
             for col, v in enumerate(vals):
