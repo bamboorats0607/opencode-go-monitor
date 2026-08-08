@@ -1331,13 +1331,36 @@ class MainWindow(QMainWindow):
 
     # ---------- 状态与在线 API ----------
     def _check_process(self):
-        if self._quitting:
+        """检测 opencode 进程（后台线程执行 subprocess，杜绝主线程卡死）。
+
+        tasklist 在系统异常时可能挂起/不可 kill，subprocess.run 的 timeout
+        kill 阶段会永久阻塞——必须在后台线程执行，结果回主线程更新 UI。
+        防重入：上次探测未结束时跳过本轮（tasklist 挂起时避免线程堆积）。
+        """
+        if self._quitting or getattr(self, "_checking_process", False):
             return
-        running = opencode_running()
+        self._checking_process = True
+
+        def _run():
+            try:
+                running = opencode_running()
+                QTimer.singleShot(0, lambda r=running: self._apply_process_check(r))
+            finally:
+                self._checking_process = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_process_check(self, running: bool):
         self.banner_process.setVisible(not running)
 
     def _probe_sse(self):
-        url = probe_sse(timeout=0.5)
+        """尽力探测 SSE 端点（后台线程执行网络调用，结果回主线程更新 UI）。"""
+        def _run():
+            url = probe_sse(timeout=0.5)
+            QTimer.singleShot(0, lambda u=url: self._apply_sse_probe(u))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_sse_probe(self, url: str | None):
         if url:
             self._health_sse = 1.0
             self.statusBar().showMessage(f"SSE 反代：已连接 {url}")
@@ -1347,7 +1370,11 @@ class MainWindow(QMainWindow):
                 "SSE /event 反代：未实现（桌面版 OpenCode 无 serve/event 端点，本应用以本地文件监听等效）")
 
     def _setup_watchdog(self):
-        """SSE 看门狗：反代心跳超时 2×interval 自动重启（尽力通道，非主通道）。"""
+        """SSE 看门狗：反代心跳超时 2×interval 自动重启（尽力通道，非主通道）。
+
+        注意：on_stall 在看门狗线程执行，禁止直接操作 QObject（跨线程 UI 操作
+        是未定义行为，曾致主线程死锁）。一律经 QTimer.singleShot 回主线程。
+        """
         if not HAS_WATCHDOG:
             return
 
@@ -1355,11 +1382,7 @@ class MainWindow(QMainWindow):
             if self._quitting:
                 return
             logger.info("SSE 心跳超时，触发看门狗重启探测")
-            self._health_sse = 0.5
-            url = probe_sse(timeout=0.5)
-            if url:
-                self._health_sse = 1.0
-                self.statusBar().showMessage(f"SSE 反代已恢复：{url}")
+            QTimer.singleShot(0, self._probe_sse)  # 回主线程，UI 操作只在主线程
 
         self._watchdog = Watchdog(interval=30.0, timeout=60.0, on_stall=_restart)
         self._watchdog.start()

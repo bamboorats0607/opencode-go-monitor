@@ -119,13 +119,22 @@ class DBWatcher:
 
 
 def opencode_running() -> bool:
-    """检测 OpenCode 进程（Windows tasklist）。"""
+    """检测 OpenCode 进程（Windows tasklist）。
+
+    注意：subprocess.run(timeout=...) 超时后内部 kill，若 tasklist 进程
+    不可终止（系统异常）会卡在第二次 communicate 永久阻塞。改用
+    Popen.communicate(timeout) 超时直接放弃等待、不 kill，杜绝卡死。
+    """
     try:
-        out = subprocess.run(
+        p = subprocess.Popen(
             ["tasklist", "/FI", "IMAGENAME eq OpenCode.exe", "/NH"],
-            capture_output=True, text=True, timeout=3,
-            creationflags=CREATE_NO_WINDOW,
-        ).stdout
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, creationflags=CREATE_NO_WINDOW,
+        )
+        try:
+            out, _ = p.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            return False  # 放弃等待（不 kill：kill 失败会永久阻塞）
         return "OpenCode.exe" in out
     except Exception:
         return False

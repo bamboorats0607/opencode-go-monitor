@@ -11,7 +11,10 @@ import argparse
 import os
 import sys
 import tempfile
+import threading
 import traceback
+
+import faulthandler
 
 from PySide6.QtCore import QLockFile
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -45,6 +48,25 @@ def _try_acquire_lock() -> QLockFile | None:
     return lock
 
 
+def _start_stack_dump():
+    """排障取证：每 20s 转储所有线程堆栈到 stderr。
+
+    主线程冻结时（无 Python traceback 的 UI 卡死），faulthandler 可从后台
+    线程转储主线程堆栈，定位冻结点。正式版（windowed）stderr 丢弃，无害。
+    """
+    import time as _time
+
+    def _loop():
+        while True:
+            _time.sleep(20)
+            try:
+                faulthandler.dump_traceback(file=sys.stderr)
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def main():
     _trace("main start")
     parser = argparse.ArgumentParser(description="OpenCode GO 用量监控")
@@ -57,6 +79,8 @@ def main():
     _trace("QApplication created")
     app.setApplicationName("OpenCode GO 用量监控")
     app.setQuitOnLastWindowClosed(False)  # 托盘驻留
+
+    _start_stack_dump()  # 排障取证：每 20s 转储线程堆栈到 stderr
 
     # 单实例锁：局部变量持有引用，生命周期覆盖整个 app.exec()（防 GC 提前释放锁）
     lock = _try_acquire_lock()
