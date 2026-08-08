@@ -61,9 +61,11 @@ class StatsDialog(QDialog):
         self.setStyleSheet(STATS_QSS)
         self.sources = {SRC_LOCAL: db_msgs or [], SRC_ONLINE: online_records or []}
         self.alerts = alerts or []
-        self._source = SRC_LOCAL
+        # 默认选中有数据的数据源（在线持久化优先，用户核心诉求是监控在线调用）
+        self._source = SRC_ONLINE if (online_records or []) else SRC_LOCAL
         self._db_path = db_path
         self._build_ui()
+        self.combo_source.setCurrentText(self._source)
         self._reload()
 
     # ---------- UI ----------
