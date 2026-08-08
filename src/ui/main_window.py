@@ -37,9 +37,9 @@ from PySide6.QtWidgets import (
     QButtonGroup, QSplitter, QMessageBox, QTabWidget, QGroupBox,
 )
 
-from src.parser import parse_rows
 from src.aggregator import hit_rate, aggregate_by_window, aggregate_by_model
-from src.watcher import DBWatcher, opencode_running, probe_sse
+from src.watcher import opencode_running, probe_sse
+from src.poller import DBPoller
 from src.usage_api import fetch_go_page, fetch_usage_page, validate_cookie
 from src.go_usage import parse_go_page, fmt_window, fmt_reset_secs
 from src.go_usage_list import (
@@ -51,6 +51,7 @@ from src.cookie_receiver import CookieReceiver, set_cookie_callback as set_recei
 from src.ui.whale_svg import WHALE_SVG
 from src.ui.log_panel import LogPanel
 from src.ui.settings_dialog import SettingsDialog
+from src.ui.stats_dialog import StatsDialog
 
 # ---- V2 新模块（T0/T1/T2 并行产出）----
 from src.core.settings import AppSettings
@@ -341,11 +342,13 @@ class MainWindow(QMainWindow):
 
         self._setup_logging()
 
-        self.watcher = DBWatcher(db_path)
+        # 异步轮询：DBWatcher/sqlite 连接独占后台线程，主线程只消费快照渲染
+        self.poller = DBPoller(db_path, int(all_s["refresh_interval_ms"]))
         self.msgs: list[dict] = []
         self.sessions: list = []
         self._tick_count = 0
         self._quitting = False
+        self._dirty = False
         self.go_data: dict | None = None
         self.go_usage_list: list[dict] = []   # 在线调用明细（全部客户端，含 Trae）
         self._go_usage_ok = False             # 在线明细是否成功拉取
@@ -382,6 +385,10 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(int(all_s["refresh_interval_ms"]))
+        # 渲染节流：数据变更合并为一次渲染，避免高频全量重建表格
+        self.render_timer = QTimer(self)
+        self.render_timer.setSingleShot(True)
+        self.render_timer.timeout.connect(self._do_render)
         self.proc_timer = QTimer(self)
         self.proc_timer.timeout.connect(self._check_process)
         self.proc_timer.start(3000)
@@ -396,14 +403,8 @@ class MainWindow(QMainWindow):
         self._watchdog = None
         QTimer.singleShot(1500, self._setup_watchdog)
 
-        # 首载
-        try:
-            self.sessions, rows = self.watcher.first_load()
-            self.msgs = parse_rows(rows)
-        except Exception as e:  # db 不存在等，UI 不崩
-            self.statusBar().showMessage(f"数据库读取失败：{e}")
-            self._health_db = 0.0
-            self.msgs, self.sessions = [], []
+        # 首载：后台线程异步完成（首载快照到达后由 _drain_db_queue 消费渲染）
+        self.poller.start()
         self._refresh()
 
         QTimer.singleShot(1000, self._probe_sse)
@@ -649,6 +650,9 @@ class MainWindow(QMainWindow):
         head.addWidget(self.lbl_status_dot)
         head.addWidget(self.lbl_status_text)
 
+        self.btn_stats = QPushButton("统计")
+        self.btn_stats.clicked.connect(self._open_stats_dialog)
+        head.addWidget(self.btn_stats)
         self.btn_settings = QPushButton("设置")
         self.btn_settings.clicked.connect(self._open_settings_dialog)
         head.addWidget(self.btn_settings)
@@ -837,27 +841,47 @@ class MainWindow(QMainWindow):
             return
         self._drain_cookie_queue()
         self._drain_go_queue()
-        try:
-            rows = self.watcher.poll()
-        except Exception:
+        self._drain_db_queue()
+
+    def _drain_db_queue(self):
+        """消费后台轮询快照：累积消息/会话，节流调度渲染（主线程只做渲染）。
+
+        轮询/解析/会话查询全部在后台线程（poller）执行，主线程不碰 sqlite。
+        """
+        snap = self.poller.take_snapshot()
+        if not snap:
+            return
+        if snap.get("type") == "error":
             self._health_db = 0.0
-            return  # db 临时不可用，下个周期重试
+            self.statusBar().showMessage(f"数据库读取异常：{snap.get('error')}")
+            return
         self._health_db = 1.0
-        if rows:
-            self.msgs.extend(parse_rows(rows))
-            self.sessions = self.watcher.fetch_sessions()
-            self._refresh()
+        new_msgs = snap.get("msgs") or []
+        if new_msgs:
+            self.msgs.extend(new_msgs)
+        if snap.get("sessions"):
+            self.sessions = snap["sessions"]
+        self._schedule_render()
+
+    def _schedule_render(self):
+        """渲染节流：多帧数据变更合并为一次渲染，避免每 500ms 全量重建表格。"""
+        self._dirty = True
+        if not self.render_timer.isActive():
+            self.render_timer.start(800)
+
+    def _do_render(self):
+        self.render_timer.stop()
+        if self._quitting or not self._dirty:
+            return
+        self._dirty = False
+        self._refresh()
 
     def _manual_refresh(self):
-        try:
-            rows = self.watcher.poll(force=True)
-            if rows:
-                self.msgs.extend(parse_rows(rows))
-            self.sessions = self.watcher.fetch_sessions()
-            self._refresh()
-            self._run_diagnostics()
-        except Exception as e:
-            self.statusBar().showMessage(f"刷新失败：{e}")
+        """手动刷新：强制后台轮询一次（force 快照总是携带最新 sessions）。"""
+        self.poller.request_force()
+        QTimer.singleShot(300, self._drain_db_queue)
+        QTimer.singleShot(400, self._run_diagnostics)
+        self.statusBar().showMessage("正在刷新…")
 
     def _refresh(self):
         self._update_kpi()
@@ -1292,6 +1316,13 @@ class MainWindow(QMainWindow):
         dlg.settings_saved.connect(self._apply_settings)
         dlg.exec()
 
+    def _open_stats_dialog(self):
+        """统计面板：天/周/月周期统计 + 选择位置导出（数据按需计算，不进轮询）。"""
+        dlg = StatsDialog(
+            self.msgs, self._recent_alerts, parent=self,
+            db_path=getattr(self.poller, "db_path", ""))
+        dlg.exec()
+
     def _apply_settings(self, new_settings: dict):
         """热加载新设置（SettingsDialog settings_saved 信号）。"""
         try:
@@ -1345,6 +1376,10 @@ class MainWindow(QMainWindow):
 
     def _really_quit(self):
         self._quitting = True
+        try:
+            self.poller.stop()
+        except Exception:
+            pass
         if self._watchdog:
             try:
                 self._watchdog.stop()

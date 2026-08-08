@@ -78,6 +78,9 @@ class AppSettings:
         value = self._qs.value(key, dflt)
         if key == "thresholds":
             return self._merged_thresholds(value)
+        if key == "log_file" and isinstance(value, str) and value and not os.path.isabs(value):
+            # 相对路径基于项目根解析（frozen=exe 目录），避免依赖启动 CWD
+            value = os.path.join(_PROJECT_ROOT, value)
         return value
 
     def set(self, key: str, value: object) -> None:
