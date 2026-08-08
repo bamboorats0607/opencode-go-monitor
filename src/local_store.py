@@ -113,6 +113,30 @@ class LocalStore:
         return written
 
     # ---------- 读（主线程调用，统计/导出） ----------
+    def fetch_page(self, limit: int = 200, offset: int = 0,
+                   min_time: int | None = None) -> list[dict]:
+        """分页取最近记录（OFFSET 分页，新在前）。
+
+        min_time（毫秒）非空时只取该时刻之后的记录（时间范围过滤）。
+        字段与写入口径一致。用于明细表格滚动分页，避免一次性全量加载。
+        """
+        sql = ("SELECT id, time_created, model, tokens_input, tokens_output, "
+               "       tokens_reasoning, cache_read, cache_write, cost, session_id "
+               "FROM usage_records")
+        args: list = []
+        if min_time is not None:
+            sql += " WHERE time_created >= ?"
+            args.append(min_time)
+        sql += " ORDER BY time_created DESC, id LIMIT ? OFFSET ?"
+        args.extend([limit, offset])
+        with self._lock:
+            try:
+                cur = self._conn.execute(sql, tuple(args))
+                return [self._row_to_dict(row) for row in cur.fetchall()]
+            except sqlite3.Error as e:
+                logger.warning("local_store: page read failed: %s", e)
+                return []
+
     def fetch_records(self, limit: int = 20000) -> list[dict]:
         """取最近记录（新在前）。字段与写入口径一致，可直接喂 stats/export。"""
         with self._lock:
@@ -122,24 +146,25 @@ class LocalStore:
                     "       tokens_reasoning, cache_read, cache_write, cost, session_id "
                     "FROM usage_records ORDER BY time_created DESC LIMIT ?",
                     (limit,))
-                return [
-                    {
-                        "id": row[0],
-                        "time_created": row[1],
-                        "modelID": row[2],
-                        "tokens_input": row[3],
-                        "tokens_output": row[4],
-                        "tokens_reasoning": row[5],
-                        "cache_read": row[6],
-                        "cache_write": row[7],
-                        "cost": row[8],
-                        "session_id": row[9],
-                    }
-                    for row in cur.fetchall()
-                ]
+                return [self._row_to_dict(row) for row in cur.fetchall()]
             except sqlite3.Error as e:
                 logger.warning("local_store: read failed: %s", e)
                 return []
+
+    @staticmethod
+    def _row_to_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "time_created": row[1],
+            "modelID": row[2],
+            "tokens_input": row[3],
+            "tokens_output": row[4],
+            "tokens_reasoning": row[5],
+            "cache_read": row[6],
+            "cache_write": row[7],
+            "cost": row[8],
+            "session_id": row[9],
+        }
 
     def count_records(self) -> int:
         with self._lock:

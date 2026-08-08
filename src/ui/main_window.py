@@ -379,6 +379,9 @@ class MainWindow(QMainWindow):
         self._tick_count = 0
         self._quitting = False
         self._dirty = False
+        # 明细表格分页加载状态（防全量加载 OOM）
+        self._msg_page = 0
+        self._msg_page_size = 200
         self.go_data: dict | None = None
         self.go_usage_list: list[dict] = []   # 在线调用明细（全部客户端，含 Trae）
         self._go_usage_ok = False             # 在线明细是否成功拉取
@@ -793,7 +796,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 4, 0)
         lay.setSpacing(6)
 
-        g_msg = QGroupBox("最近请求（时间范围过滤 · 低命中标红）")
+        g_msg = QGroupBox("最近请求（时间范围过滤 · 低命中标红 · 滚动加载更多）")
         mv = QVBoxLayout(g_msg)
         self.table_msgs = QTableWidget(0, 7)
         self.table_msgs.setHorizontalHeaderLabels(
@@ -806,6 +809,8 @@ class MainWindow(QMainWindow):
         mh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         for i in range(2, 7):
             mh.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        # 分页加载：滚动到底自动追加下一页（防全量加载 OOM）
+        self.table_msgs.verticalScrollBar().valueChanged.connect(self._on_msg_scroll)
         mv.addWidget(self.table_msgs)
         lay.addWidget(g_msg, 1)
 
@@ -893,6 +898,10 @@ class MainWindow(QMainWindow):
         new_msgs = snap.get("msgs") or []
         if new_msgs:
             self.msgs.extend(new_msgs)
+            # 本地消息内存上限：超过 10 万条丢弃最旧（防长期运行 OOM）
+            MAX_LOCAL_MSGS = 100_000
+            if len(self.msgs) > MAX_LOCAL_MSGS:
+                self.msgs = self.msgs[-MAX_LOCAL_MSGS:]
         if snap.get("sessions"):
             self.sessions = snap["sessions"]
         self._schedule_render()
@@ -1227,40 +1236,56 @@ class MainWindow(QMainWindow):
         t.setUpdatesEnabled(True)
 
     def _update_msg_table(self):
-        """最近请求表格：时间/模型/输入/缓存命中/输出/命中率/成本。
+        """最近请求表格（分页加载，防全量加载 OOM）。
 
         数据源优先级（统一字段，单一路径）：
-          1) 在线持久化库（30 天，覆盖所有客户端含 Trae）——默认
+          1) 在线持久化库（30 天，OFFSET 分页查询）——默认
           2) 实时在线明细（cookie 有效时）——持久化未就绪兜底
-          3) 本地 opencode.db 消息（仅 opencode CLI 客户端）——在线不可用时回退
+          3) 本地 opencode.db 消息——在线不可用时回退
+        每次刷新渲染第一页；滚动到底由 _on_msg_scroll 追加下一页。
         """
         t = self.table_msgs
-        low_input = int(self.thresholds.get("suspicious_input_min", DEFAULT_LOW_INPUT))
-        miss_ratio = float(self.thresholds.get("miss_ratio", DEFAULT_MISS_RATIO))
+        self._msg_page = 0
+        self._append_msg_page()
 
-        recs = self._agg_source()
-        # 按时间范围过滤（统一字段 time_created 毫秒）
+    def _msg_min_time(self) -> int | None:
         ms = TIME_RANGE_MS.get(self.time_range)
         if ms:
-            now = int(time.time() * 1000)
-            recs = [r for r in recs if (r.get("time_created") or 0) >= now - ms]
+            return int(time.time() * 1000) - ms
+        return None
 
-        # 低命中标红置顶（沿用 V1 语义，用比例阈值）
-        low = [m for m in recs
-               if m["tokens_input"] > low_input
-               and (m["cache_read"] / m["tokens_input"]) < miss_ratio]
-        normal = [m for m in recs if m not in low]
-        low.sort(key=lambda m: -(m.get("time_created") or 0))
-        normal.sort(key=lambda m: -(m.get("time_created") or 0))
-        ordered = (low + normal)[:200]  # 只显示最近 200 条
-        low_set = set(id(m) for m in low)
+    def _fetch_msg_page(self, page: int) -> list[dict]:
+        """按页取明细（time_created 降序）。返回统一字段 dict 列表。"""
+        size = self._msg_page_size
+        min_time = self._msg_min_time()
+        try:
+            if getattr(self, "local_store", None):
+                recs = self.local_store.fetch_page(size, page * size, min_time)
+                if recs:
+                    return recs
+        except Exception:
+            pass
+        if self._go_usage_ok and self.go_usage_list:
+            all_ = [_go_rec_to_usage(r) for r in self.go_usage_list]
+        else:
+            all_ = list(self.msgs)
+        all_ = [r for r in all_ if (r.get("time_created") or 0) >= (min_time or 0)]
+        all_.sort(key=lambda r: -(r.get("time_created") or 0))
+        return all_[page * size:(page + 1) * size]
 
-        t.setRowCount(0)
+    def _append_msg_page(self) -> None:
+        """渲染当前页（_msg_page）到表格；无更多数据时显示空提示。"""
+        t = self.table_msgs
+        rows = self._fetch_msg_page(self._msg_page)
+        low_input = int(self.thresholds.get("suspicious_input_min", DEFAULT_LOW_INPUT))
+        miss_ratio = float(self.thresholds.get("miss_ratio", DEFAULT_MISS_RATIO))
         t.setUpdatesEnabled(False)
-        for row, m in enumerate(ordered):
-            t.insertRow(row)
-            is_low = id(m) in low_set
+        for m in rows:
+            r = t.rowCount()
+            t.insertRow(r)
             hit = hit_rate(m["cache_read"], m["tokens_input"])
+            is_low = (m["tokens_input"] > low_input
+                      and (m["cache_read"] / m["tokens_input"]) < miss_ratio)
             vals = [
                 _fmt_time(m["time_created"]),
                 m["modelID"] or "",
@@ -1277,8 +1302,20 @@ class MainWindow(QMainWindow):
                     item.setBackground(QColor("#3d1a1a"))
                 elif col in (3, 5):
                     item.setForeground(QColor(BLUE))
-                t.setItem(row, col, item)
+                t.setItem(r, col, item)
         t.setUpdatesEnabled(True)
+
+    def _on_msg_scroll(self, value: int) -> None:
+        """滚动接近底部时加载下一页。"""
+        if self._quitting:
+            return
+        sb = self.table_msgs.verticalScrollBar()
+        if value >= sb.maximum() - 8:
+            self._msg_page += 1
+            before = self.table_msgs.rowCount()
+            self._append_msg_page()
+            if self.table_msgs.rowCount() == before:
+                self._msg_page -= 1  # 无更多数据，回退页码
 
     # ---------- 状态与在线 API ----------
     def _check_process(self):
