@@ -13,6 +13,7 @@ Cookie 获取优先级：
 import logging
 
 import httpx
+from httpx import RequestError  # 显式导入：确保 PyInstaller 打包异常子模块
 
 GO_PAGE_URL = "https://opencode.ai/workspace/{workspace_id}/go"
 GO_USAGE_URL = "https://opencode.ai/workspace/{workspace_id}/usage"
@@ -45,7 +46,7 @@ def fetch_go_page(cookie: str, workspace_id: str) -> tuple[bool, str, int | None
             timeout=TIMEOUT,
             follow_redirects=True,
         )
-    except httpx.RequestException as e:
+    except httpx.RequestError as e:
         return False, f"网络错误：{e}", None
     if r.status_code in (401, 403):
         return False, f"Cookie 已失效（HTTP {r.status_code}），已降级为纯本地模式", r.status_code
@@ -73,7 +74,7 @@ def fetch_usage_page(cookie: str, workspace_id: str) -> tuple[bool, str, int | N
             timeout=TIMEOUT,
             follow_redirects=True,
         )
-    except httpx.RequestException as e:
+    except httpx.RequestError as e:
         return False, f"网络错误：{e}", None
     if r.status_code in (401, 403):
         return False, f"Cookie 已失效（HTTP {r.status_code}），已降级为纯本地模式", r.status_code

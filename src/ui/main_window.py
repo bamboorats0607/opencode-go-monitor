@@ -1255,9 +1255,22 @@ class MainWindow(QMainWindow):
         return None
 
     def _fetch_msg_page(self, page: int) -> list[dict]:
-        """按页取明细（time_created 降序）。返回统一字段 dict 列表。"""
+        """按页取明细（time_created 降序）。返回统一字段 dict 列表。
+
+        数据源优先级（内存优先，追求可用）：
+          1) 在线内存实时明细（go_usage_list）——最新拉取即时可见，无需等写库
+          2) 在线持久化库（LocalStore）——内存未就绪（启动期）查库兜底历史
+          3) 本地 opencode.db 消息——在线不可用时降级
+        """
         size = self._msg_page_size
         min_time = self._msg_min_time()
+        # 1) 在线实时（内存）：拉取结果已合并进 go_usage_list，立即渲染
+        if self._go_usage_ok and self.go_usage_list:
+            all_ = [_go_rec_to_usage(r) for r in self.go_usage_list]
+            all_ = [r for r in all_ if (r.get("time_created") or 0) >= (min_time or 0)]
+            all_.sort(key=lambda r: -(r.get("time_created") or 0))
+            return all_[page * size:(page + 1) * size]
+        # 2) 持久化库（启动期内存未就绪时查历史）
         try:
             if getattr(self, "local_store", None):
                 recs = self.local_store.fetch_page(size, page * size, min_time)
@@ -1265,10 +1278,8 @@ class MainWindow(QMainWindow):
                     return recs
         except Exception:
             pass
-        if self._go_usage_ok and self.go_usage_list:
-            all_ = [_go_rec_to_usage(r) for r in self.go_usage_list]
-        else:
-            all_ = list(self.msgs)
+        # 3) 本地 db 降级
+        all_ = list(self.msgs)
         all_ = [r for r in all_ if (r.get("time_created") or 0) >= (min_time or 0)]
         all_.sort(key=lambda r: -(r.get("time_created") or 0))
         return all_[page * size:(page + 1) * size]
