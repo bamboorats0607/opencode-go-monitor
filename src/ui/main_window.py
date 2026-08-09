@@ -539,6 +539,10 @@ class MainWindow(QMainWindow):
             status_text = payload  # 失败时 payload 即原因文本
             ok2, html2, _status2 = fetch_usage_page(cookie, self.workspace_id)
             new_recs = parse_usage_list(html2) if ok2 else []
+            if ok2:
+                tcs = [r.get("timeCreated") or "" for r in new_recs if r.get("timeCreated")]
+                logger.info("[探针] 拉取usage: ok=%s new_recs=%d 最新tc=%s",
+                            ok2, len(new_recs), max(tcs) if tcs else "无")
             self._go_usage_queue.put({
                 "ok": ok, "go_data": go_data, "new_recs": new_recs,
                 "status_text": status_text, "status": status,
@@ -553,13 +557,20 @@ class MainWindow(QMainWindow):
             self._go_refreshing = False
 
     def _drain_go_queue(self):
-        """主线程轮询：应用后台拉取结果并更新 UI（由 _tick 调用）。"""
-        try:
-            while True:
+        """主线程轮询：应用后台拉取结果并更新 UI（由 _tick 调用）。
+
+        逐条 try/except：单条记录异常只跳过该条并记日志，不能退出 while
+        静默吞掉——否则队列残留、明细永久冻结且无任何错误线索。
+        """
+        while True:
+            try:
                 r = self._go_usage_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
                 self._apply_go_result(r)
-        except Exception:
-            pass  # queue.Empty
+            except Exception as e:
+                logger.error("应用在线拉取结果失败: %s", e, exc_info=True)
 
     def _apply_go_result(self, r: dict):
         go_data = r.get("go_data")
@@ -586,6 +597,8 @@ class MainWindow(QMainWindow):
                 "（含 opencode CLI / Trae 等所有客户端）")
             # 异步持久化：仅入队，写入由轮询后台线程执行（30 日 LRU 淘汰）
             self.poller.submit([_go_rec_to_usage(r) for r in new_recs])
+            logger.info("[探针] 应用在线拉取: new_recs=%d 合并后=%d",
+                        len(new_recs), len(self.go_usage_list))
         elif r.get("usage_ok") is not None and not r["usage_ok"]:
             self._go_usage_ok = False
         if go_data is None and not new_recs and r.get("ok"):
@@ -878,6 +891,14 @@ class MainWindow(QMainWindow):
         self._tick_count += 1
         if self._quitting:
             return
+        # 探针心跳：每 30s 记录一次主线程与队列状态（证明事件循环存活）
+        if self._tick_count % 60 == 0:
+            logger.info("[心跳] tick=%d go队列=%d 拉取中=%s 在线ok=%s 在线明细=%d 本地消息=%d",
+                        self._tick_count, self._go_usage_queue.qsize(),
+                        getattr(self, "_go_refreshing", False),
+                        getattr(self, "_go_usage_ok", False),
+                        len(getattr(self, "go_usage_list", [])),
+                        len(getattr(self, "msgs", [])))
         self._drain_cookie_queue()
         self._drain_go_queue()
         self._drain_db_queue()
@@ -1248,6 +1269,14 @@ class MainWindow(QMainWindow):
         self._msg_page = 0
         t.setRowCount(0)   # 先清空，避免轮询刷新时重复追加堆积
         self._append_msg_page()
+        # 探针：仅在数据源/行数变化时记录（渲染节流 800ms 高频，不变化不刷屏）
+        src = ("内存" if self._go_usage_ok and self.go_usage_list else
+               ("库" if getattr(self, "local_store", None) else "本地db"))
+        key = (src, t.rowCount(), len(getattr(self, "go_usage_list", [])))
+        if getattr(self, "_msg_probe_key", None) != key:
+            self._msg_probe_key = key
+            logger.info("[探针] 刷新明细: 源=%s 行数=%d go_list=%d",
+                        src, t.rowCount(), len(getattr(self, "go_usage_list", [])))
 
     def _msg_min_time(self) -> int | None:
         ms = TIME_RANGE_MS.get(self.time_range)
