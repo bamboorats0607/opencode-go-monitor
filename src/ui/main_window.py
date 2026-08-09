@@ -588,10 +588,15 @@ class MainWindow(QMainWindow):
                 self._health_api = 0.0
                 self.banner_cookie.setVisible(True)
         new_recs = r.get("new_recs") or []
+        usage_ok = r.get("usage_ok")
+        if usage_ok:
+            # 拉取成功即恢复在线数据源（不能依赖 new_recs 非空：窗口内无新
+            # 记录时 new_recs 为空，若此时不恢复，一次网络抖动后明细会永久
+            # 停留在"库"分支，表现为"读了数据库就卡住，一直是数据库"）
+            self._go_usage_ok = True
         if new_recs:
             self.go_usage_list = merge_incremental(
                 getattr(self, "go_usage_list", []), new_recs)
-            self._go_usage_ok = True
             self.go_status_text = (
                 f"在线额度已连接 · 全量调用 {len(self.go_usage_list)} 条"
                 "（含 opencode CLI / Trae 等所有客户端）")
@@ -599,7 +604,7 @@ class MainWindow(QMainWindow):
             self.poller.submit([_go_rec_to_usage(r) for r in new_recs])
             logger.info("[探针] 应用在线拉取: new_recs=%d 合并后=%d",
                         len(new_recs), len(self.go_usage_list))
-        elif r.get("usage_ok") is not None and not r["usage_ok"]:
+        if usage_ok is not None and not usage_ok:
             self._go_usage_ok = False
         if go_data is None and not new_recs and r.get("ok"):
             self.go_status_text = r.get("status_text", self.go_status_text)
@@ -1287,20 +1292,34 @@ class MainWindow(QMainWindow):
     def _fetch_msg_page(self, page: int) -> list[dict]:
         """按页取明细（time_created 降序）。返回统一字段 dict 列表。
 
-        数据源优先级（内存优先，追求可用）：
-          1) 在线内存实时明细（go_usage_list）——最新拉取即时可见，无需等写库
-          2) 在线持久化库（LocalStore）——内存未就绪（启动期）查库兜底历史
-          3) 本地 opencode.db 消息——在线不可用时降级
+        数据源承上启下（一致性子设计）：
+          1) 在线合并源（首选）：内存最新（go_usage_list，含未落库实时记录）
+             先读，缺失的历史再从库（LocalStore 已落库全量）补齐，按 id 去重、
+             时间降序、分页返回——交集=重复 id 去重（并集=内存∪库全集）。
+             实时记录即时可见（不等异步落库），历史完整（不看 SSR 窗口），
+             重启后历史从库恢复。
+          2) 库兜底（在线未连接）：显示已持久化历史。
+          3) 本地 opencode.db：最终降级。
         """
         size = self._msg_page_size
         min_time = self._msg_min_time()
-        # 1) 在线实时（内存）：拉取结果已合并进 go_usage_list，立即渲染
-        if self._go_usage_ok and self.go_usage_list:
-            all_ = [_go_rec_to_usage(r) for r in self.go_usage_list]
-            all_ = [r for r in all_ if (r.get("time_created") or 0) >= (min_time or 0)]
+        # 1) 在线合并源：内存先读 → 库补齐 → id 去重 → 降序 → 分页
+        if self._go_usage_ok:
+            mem: dict[str, dict] = {}
+            for r in self.go_usage_list:
+                u = _go_rec_to_usage(r)
+                mem[u["id"]] = u
+            try:
+                if getattr(self, "local_store", None):
+                    for rec in self.local_store.fetch_records():
+                        mem[rec["id"]] = rec  # 已落库记录覆盖（幂等去重）
+            except Exception:
+                pass
+            all_ = [r for r in mem.values()
+                    if (r.get("time_created") or 0) >= (min_time or 0)]
             all_.sort(key=lambda r: -(r.get("time_created") or 0))
             return all_[page * size:(page + 1) * size]
-        # 2) 持久化库（启动期内存未就绪时查历史）
+        # 2) 库兜底（在线未连接时显示已持久化历史）
         try:
             if getattr(self, "local_store", None):
                 recs = self.local_store.fetch_page(size, page * size, min_time)
